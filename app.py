@@ -1,144 +1,114 @@
 import re
-import time
-from datetime import date, timedelta
 from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 import streamlit as st
 import dns.resolver
-import requests
 from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="Domain Monitor Pro", page_icon="📬", layout="wide")
-st.title("Domain DNS & Email Health Monitor")
-st.caption("Public DNS diagnostics, optional blocklist checks and authorized Google Postmaster statistics. DNS health is NOT Gmail reputation.")
+st.set_page_config(page_title="Domain Monitor Free", page_icon="🔎", layout="wide")
+st.title("Domain Monitor — 100% Free")
+st.caption("Public DNS and email authentication diagnostics. No account, API key or Google authorization required.")
 
-def lookup(name, kind, timeout=3):
+def query(name, typ):
     try:
-        ans = dns.resolver.resolve(name, kind, lifetime=timeout)
-        return [str(x).strip('"') for x in ans]
+        r = dns.resolver.Resolver()
+        r.timeout = 2
+        r.lifetime = 4
+        return [str(x).strip('"') for x in r.resolve(name, typ)]
     except Exception:
         return []
 
-def valid_domain(d):
-    return bool(len(d) <= 253 and re.fullmatch(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}", d))
+def domain_ok(d):
+    return len(d) <= 253 and bool(re.fullmatch(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}", d))
 
-def policy(record):
-    m = re.search(r"(?:^|;)\s*p\s*=\s*(none|quarantine|reject)\b", record, re.I)
-    return m.group(1).lower() if m else "Unclear"
+def get_tags(record):
+    return {m.group(1).lower(): m.group(2).strip().lower()
+            for m in re.finditer(r"(?:^|;)\s*([a-z]+)\s*=\s*([^;]+)", record, re.I)}
 
-def dnsbl(ip, zones):
-    try:
-        parts = ip.split(".")
-        if len(parts) != 4 or any(not x.isdigit() or not 0 <= int(x) <= 255 for x in parts):
-            return "Not checked"
-        reverse = ".".join(reversed(parts))
-        listed = [zone for zone in zones if lookup(reverse + "." + zone, "A", 2)]
-        return ", ".join(listed) if listed else "No listing found (selected lists)"
-    except Exception:
-        return "Check unavailable"
-
-def check(domain, selector, blocklists):
-    domain = domain.lower().strip().rstrip(".")
-    if not valid_domain(domain):
-        return {"Domain": domain, "Status": "Invalid domain", "Health score": None}
-    a = lookup(domain, "A")
-    mx = lookup(domain, "MX")
-    txt = lookup(domain, "TXT")
-    spfs = [x for x in txt if x.lower().startswith("v=spf1")]
-    dmarcs = [x for x in lookup("_dmarc." + domain, "TXT") if x.lower().startswith("v=dmarc1")]
-    dkims = [x for x in lookup(selector + "._domainkey." + domain, "TXT") if "v=dkim1" in x.lower() or "p=" in x.lower()] if selector else []
-    dkim_cname = lookup(selector + "._domainkey." + domain, "CNAME") if selector else []
-    dmarc_policy = policy(dmarcs[0]) if dmarcs else "Missing"
-    # Diagnostic score only: not deliverability, not Gmail reputation.
-    score = (20 if a else 0) + (20 if mx else 0) + (25 if len(spfs) == 1 else 0) + (25 if len(dmarcs) == 1 and dmarc_policy != "Unclear" else 0)
+def scan(domain, selector):
+    d=domain.strip().lower().rstrip(".")
+    if not domain_ok(d):
+        return {"Domain":d, "Status":"Invalid domain"}
+    a=query(d,"A")
+    aaaa=query(d,"AAAA")
+    mx=query(d,"MX")
+    txt=query(d,"TXT")
+    spf=[v for v in txt if v.lower().startswith("v=spf1")]
+    dm=[v for v in query("_dmarc."+d,"TXT") if v.lower().startswith("v=dmarc1")]
+    tags=get_tags(dm[0]) if len(dm)==1 else {}
+    dk="Not checked (selector required)"
     if selector:
-        score += 10 if dkims or dkim_cname else 0
-    else:
-        score += 10 if dmarcs and dmarc_policy in ("quarantine", "reject") else 0
-    return {
-        "Domain": domain, "Status": "Checked", "Health score": score,
-        "A": ", ".join(a) or "Missing", "MX": ", ".join(mx) or "Missing",
-        "SPF": spfs[0] if spfs else "Missing",
-        "SPF records": len(spfs),
-        "DMARC policy": dmarc_policy,
-        "DMARC record": dmarcs[0] if dmarcs else "Missing",
-        "DKIM selector": selector or "Not provided",
-        "DKIM DNS": ("Found" if dkims or dkim_cname else "Not found") if selector else "Not checked",
-        "Selected DNSBLs": dnsbl(a[0], blocklists) if a and blocklists else "Not checked",
-        "Gmail reputation": "Requires verified Google Postmaster access",
-    }
+        qname=selector+"._domainkey."+d
+        dk="Record found" if query(qname,"TXT") or query(qname,"CNAME") else "Record not found"
+    warnings=[]
+    if not mx: warnings.append("MX missing (if receiving mail)")
+    if len(spf)==0: warnings.append("SPF missing")
+    if len(spf)>1: warnings.append("Multiple SPF records")
+    if len(dm)==0: warnings.append("DMARC missing")
+    if len(dm)>1: warnings.append("Multiple DMARC records")
+    if len(dm)==1 and tags.get("p") not in ("none","quarantine","reject"):
+        warnings.append("DMARC policy invalid/missing")
+    if len(dm)==1 and tags.get("p")=="none":
+        warnings.append("DMARC monitoring-only policy")
+    if selector and dk=="Record not found": warnings.append("DKIM selector DNS not found")
+    if not a and not aaaa: warnings.append("No A/AAAA record (may be normal for mail-only domains)")
+    return {"Domain":d,"Status":"Checked","A":", ".join(a) or "—",
+            "AAAA":", ".join(aaaa) or "—","MX":", ".join(mx) or "—",
+            "SPF":spf[0] if len(spf)==1 else ("Missing" if not spf else "Multiple records"),
+            "SPF count":len(spf),
+            "DMARC":dm[0] if len(dm)==1 else ("Missing" if not dm else "Multiple records"),
+            "DMARC policy":tags.get("p","—"),
+            "DKIM selector":selector or "—","DKIM DNS":dk,
+            "Warnings":"; ".join(warnings) or "No issues detected by these basic checks",
+            "Gmail reputation":"Not publicly available"}
 
-def postmaster(domain):
-    """Optional Google Postmaster Tools API. Only verified, authorized domains."""
-    try:
-        cfg = st.secrets.get("postmaster", {})
-        cid, secret, refresh = cfg.get("client_id"), cfg.get("client_secret"), cfg.get("refresh_token")
-        if not all((cid, secret, refresh)):
-            return "Not connected", "Not connected", "Not connected"
-        token_response = requests.post("https://oauth2.googleapis.com/token",
-            data={"client_id": cid, "client_secret": secret, "refresh_token": refresh, "grant_type": "refresh_token"}, timeout=10)
-        token_response.raise_for_status()
-        token = token_response.json()["access_token"]
-        headers = {"Authorization": "Bearer " + token}
-        # Recent dates may be delayed; try the last 7 completed days.
-        for days_ago in range(1, 8):
-            d = (date.today() - timedelta(days=days_ago)).isoformat()
-            url = f"https://gmailpostmastertools.googleapis.com/v1/domains/{domain}/trafficStats/{d}"
-            r = requests.get(url, headers=headers, timeout=10)
-            if r.status_code == 404:
-                continue
-            if r.status_code in (401, 403):
-                return "Not authorized", "Not authorized", "Not authorized"
-            r.raise_for_status()
-            data = r.json()
-            return data.get("domainReputation", "No data"), data.get("userReportedSpamRatio", "No data"), d
-        return "No recent data", "No recent data", "—"
-    except Exception:
-        return "API unavailable", "API unavailable", "—"
+def check_dnsbl(ip, zones):
+    if not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}",ip): return "Not checked"
+    octets=ip.split(".")
+    if any(int(o)>255 for o in octets): return "Not checked"
+    reverse=".".join(reversed(octets))
+    results=[]
+    for zone in zones:
+        if query(reverse+"."+zone,"A"): results.append(zone)
+    return ", ".join(results) if results else "No listing detected / DNS access may be restricted"
 
 with st.sidebar:
-    st.header("Settings")
-    selector = st.text_input("DKIM selector (optional)", placeholder="selector1").strip()
-    use_dnsbl = st.checkbox("Check public DNS blocklists (A record IP only)", value=False)
-    zones = ["zen.spamhaus.org", "bl.spamcop.net"] if use_dnsbl else []
-    use_postmaster = st.checkbox("Check authorized Google Postmaster data", value=False)
-    refresh = st.selectbox("Auto-refresh", ["Off", "5 minutes", "15 minutes", "60 minutes"])
-    st.caption("DNSBL checks may be restricted by hosting provider DNS. A-record IP is not necessarily your sending IP.")
-    st.caption("DKIM DNS existence does not prove signed messages pass authentication.")
+    st.header("Options")
+    selector=st.text_input("DKIM selector (optional)", placeholder="selector1").strip().lower()
+    if selector and not re.fullmatch(r"[a-z0-9_-]{1,63}",selector):
+        st.error("Invalid DKIM selector")
+        st.stop()
+    dnsbl=st.checkbox("Optional public DNSBL lookup (website A IP, not necessarily sending IP)",value=False)
+    refresh=st.selectbox("Refresh while app is open",["Off","5 minutes","15 minutes","60 minutes"])
+    st.caption("DNSBL queries can fail on cloud hosts. Results are not definitive.")
+    st.caption("DKIM record presence does not prove DKIM passes on sent messages.")
 
-raw = st.text_area("Domains (one per line)", value=st.session_state.get("domains", ""), height=160,
-                   placeholder="example.com\nexample.org")
-run = st.button("Check domains", type="primary")
-if run:
-    st.session_state["domains"] = raw
-    st.session_state["checked"] = True
+raw=st.text_area("Enter domains, one per line",height=170,placeholder="example.com\nexample.org")
+if st.button("Check domains",type="primary"):
+    st.session_state["domains"]=raw
+    st.session_state["started"]=True
 
-intervals = {"Off": 0, "5 minutes": 300000, "15 minutes": 900000, "60 minutes": 3600000}
-if intervals[refresh] and st.session_state.get("checked"):
-    st_autorefresh(interval=intervals[refresh], key="domain_refresh")
+ms={"Off":0,"5 minutes":300000,"15 minutes":900000,"60 minutes":3600000}[refresh]
+if ms and st.session_state.get("started"):
+    st_autorefresh(interval=ms,key="refresh")
 
-if st.session_state.get("checked"):
-    domains = list(dict.fromkeys(x.strip().lower().rstrip(".") for x in st.session_state["domains"].splitlines() if x.strip()))[:100]
+if st.session_state.get("started"):
+    domains=list(dict.fromkeys(x.strip().lower().rstrip(".") for x in st.session_state["domains"].splitlines() if x.strip()))[:100]
     if not domains:
         st.warning("Enter at least one domain.")
     else:
-        with st.spinner("Checking domains..."):
+        with st.spinner("Checking public DNS..."):
             with ThreadPoolExecutor(max_workers=8) as pool:
-                rows = list(pool.map(lambda d: check(d, selector, zones), domains))
-            if use_postmaster:
+                rows=list(pool.map(lambda d:scan(d,selector),domains))
+            if dnsbl:
                 for row in rows:
-                    if row["Status"] == "Checked":
-                        rep, spam, asof = postmaster(row["Domain"])
-                        row["Gmail reputation"] = rep
-                        row["Gmail spam ratio"] = spam
-                        row["Postmaster data date"] = asof
-        df = pd.DataFrame(rows)
-        checked = df[df["Status"] == "Checked"]
-        a,b,c = st.columns(3)
-        a.metric("Domains checked", len(checked))
-        b.metric("Average DNS health", f'{checked["Health score"].mean():.0f}/100' if len(checked) else "—")
-        c.metric("DMARC missing", int((checked["DMARC policy"] == "Missing").sum()) if len(checked) else 0)
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        st.download_button("Download CSV", df.to_csv(index=False).encode(), "domain_monitor_results.csv", "text/csv")
-        st.caption("Health score is an illustrative DNS configuration score, not an inbox-placement or reputation prediction.")
-st.info("Gmail domain reputation is not public or real-time. For verified domains, configure Google Postmaster OAuth credentials in Streamlit Secrets.")
+                    ips=[x.strip() for x in row.get("A","").split(",") if x.strip() not in ("","—")]
+                    row["A IP DNSBL"]=check_dnsbl(ips[0],["zen.spamhaus.org","bl.spamcop.net"]) if ips else "No A IP"
+        df=pd.DataFrame(rows)
+        c1,c2,c3=st.columns(3)
+        c1.metric("Domains",len(df))
+        c2.metric("Valid checked",int((df["Status"]=="Checked").sum()))
+        c3.metric("DMARC missing",int((df.get("DMARC",pd.Series(dtype=str))=="Missing").sum()))
+        st.dataframe(df,use_container_width=True,hide_index=True)
+        st.download_button("Download CSV",df.to_csv(index=False).encode("utf-8-sig"),"domain_monitor.csv","text/csv")
+st.info("This app does not estimate Gmail reputation, spam placement, or deliverability. Only Google-authorized sender data can provide Gmail Postmaster reputation.")
